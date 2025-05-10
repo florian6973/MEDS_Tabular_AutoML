@@ -134,14 +134,14 @@ class TabularDataset(TimeableMixin):
         cached_labels, cached_event_ids = dict(), dict()
         for shard, label_fp in label_fps.items():
             label_df = pl.scan_parquet(label_fp)
-            if "event_id" not in label_df.schema:
+            if "event_id" not in label_df.collect_schema().names():
                 label_df = label_df.with_row_index("event_id")
 
             if load_ids:
                 cached_event_ids[shard] = label_df.select(pl.col("event_id")).collect().to_series()
 
             if load_labels:
-                label_col = "boolean_value" if "boolean_value" in label_df.schema else "label"
+                label_col = "boolean_value" if "boolean_value" in label_df.collect_schema().names() else "label"
                 cached_labels[shard] = label_df.select(pl.col(label_col)).collect().to_series()
                 if self.cfg.data_loading_params.binarize_task:
                     cached_labels[shard] = cached_labels[shard].map_elements(

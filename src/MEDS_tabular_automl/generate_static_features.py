@@ -249,7 +249,8 @@ def get_flat_static_rep(
         raise ValueError(f"No static features found. Remove the aggregation function {agg}")
     # convert to sparse_matrix
     if label_df is not None:
-        event_df = label_df.rename({"prediction_time": "time"})
+        if "time" not in label_df.schema:
+            event_df = label_df.rename({"prediction_time": "time"})
     else:
         event_df = get_unique_time_events_df(get_events_df(shard_df, feature_columns))
 

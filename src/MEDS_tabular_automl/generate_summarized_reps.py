@@ -42,6 +42,63 @@ def sparse_aggregate(sparse_matrix: sparray, agg: str) -> np.ndarray | coo_array
         raise ValueError(f"Aggregation method '{agg}' not implemented.")
     return merged_matrix
 
+import pandas as pd
+import polars as pl
+from scipy.sparse import coo_array
+
+def get_rolling_window_indices_totest(
+    index_df: pl.LazyFrame,
+    window_size: str,
+    label_df: pl.LazyFrame | None = None,
+) -> pl.DataFrame:
+    """
+    Returns a collected Polars DataFrame with columns ['min_idx', 'max_idx'].
+
+    - Builds exactly one lazy pipeline.
+    - Only calls .collect() once at the end.
+    """
+    # 1) compute time delta
+    if window_size == "full":
+        period = pd.Timedelta(150 * 52, unit="W")
+    else:
+        period = pd.Timedelta(window_size)
+
+    # 2) base rolling-window on every event
+    base = (
+        index_df
+        .with_row_index("idx")                                # add 0-based row index
+        .rolling(
+            index_column="time",
+            period=period,
+            group_by="subject_id",
+        )
+        .agg([
+            pl.col("idx").min().alias("min_idx"),
+            (pl.col("idx").max() + 1).alias("max_idx"),      # make upper bound exclusive
+        ])
+        .select(["min_idx", "max_idx"])
+    )
+
+    if label_df is not None:
+        # 3) rename prediction_time → time in one lazy step
+        labels = label_df.rename({"prediction_time": "time"})
+        # 4) join_asof to pick the correct window for each label
+        result = (
+            labels
+            .join_asof(
+                base.with_row_index("idx_base"),             # re-index original events
+                by="subject_id",
+                left_on="time",
+                right_on="time",
+            )
+            .select(["min_idx", "max_idx"])
+            .fill_null(0)                                   # if no prior window, zero it out
+        )
+    else:
+        result = base
+
+    # 5) exactly one collect
+    return result.collect()
 
 def get_rolling_window_indicies(
     index_df: pl.LazyFrame, window_size: str, label_df: pl.LazyFrame = None
@@ -150,8 +207,7 @@ def get_rolling_window_indicies(
     )
     if label_df is not None:
         event_df = pl.concat([index_df, windows.lazy()], how="horizontal")
-
-        if "time" not in label_df.schema:
+        if "time" not in label_df.collect_schema().names():
             label_df = label_df.rename({"prediction_time": "time"})
             
         windows = (
@@ -247,8 +303,58 @@ def aggregate_matrix(
     )
     return out_matrix
 
-
 def compute_agg(
+    index_df: pl.LazyFrame,
+    matrix: sparray,
+    window_size: str,
+    agg: str,
+    num_features: int,
+    label_df: pl.LazyFrame | None = None,
+    use_tqdm: bool = False,
+) -> csr_array:
+    if label_df is not None and "prediction_time" in label_df.collect_schema().names():
+        label_df = label_df.rename({"prediction_time": "time"})
+    
+    idx_with_row = index_df.with_row_index("index")
+    if label_df is not None:
+        idx_with_row = idx_with_row.sort(["subject_id", "time"])
+        event_times = (
+            label_df
+            .select("subject_id", "time")
+            .sort(["subject_id", "time"])
+        )
+
+        idx_with_row = idx_with_row.join_asof(
+            event_times,
+            by="subject_id",
+            on="time"
+        )
+    group_df = (
+        idx_with_row
+        .group_by(["subject_id", "time"], maintain_order=True)
+        .agg([
+            pl.col("index").min().alias("min_index"),
+            pl.col("index").max().alias("max_index"),
+        ])
+        .collect()
+    )
+    index_df = group_df.lazy().select(pl.col("subject_id"), pl.col("time"))
+    windows = group_df.select(pl.col("min_index"), pl.col("max_index"))
+
+    logger.info("Step 1.5: Running sparse aggregation.")
+    matrix = aggregate_matrix(windows, matrix, agg, num_features, use_tqdm)
+
+    logger.info("Step 2: computing rolling windows and aggregating.")
+    if label_df is not None:
+        windows = get_rolling_window_indicies(index_df, window_size, label_df)
+    else:
+        windows = get_rolling_window_indicies(index_df, window_size)
+
+    logger.info("Starting final sparse aggregations.")
+    matrix = aggregate_matrix(windows, matrix, agg, num_features, use_tqdm)
+    return matrix
+
+def compute_agg_old(
     index_df: pl.LazyFrame,
     matrix: sparray,
     window_size: str,
@@ -283,7 +389,7 @@ def compute_agg(
     )
     index_df = group_df.lazy().select(pl.col("subject_id", "time"))
     windows = group_df.select(pl.col("min_index", "max_index"))
-    
+
     logger.info("Step 1.5: Running sparse aggregation.")
     matrix = aggregate_matrix(windows, matrix, agg, num_features, use_tqdm)
 

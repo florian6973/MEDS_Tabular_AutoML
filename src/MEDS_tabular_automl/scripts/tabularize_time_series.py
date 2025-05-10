@@ -1,14 +1,19 @@
 #!/usr/bin/env python
 
 """Aggregates time-series data for feature columns across different window sizes."""
+import os
+os.environ['MIMALLOC_ABANDONED_PAGE_RESET'] = '1' # https://community.plotly.com/t/dash-polars-ram-use-keeps-increasing/86041/3
+           
+
 import polars as pl
 
-pl.enable_string_cache()
 
 import gc
 from importlib.resources import files
 from itertools import product
 from pathlib import Path
+
+import time
 
 import hydra
 import numpy as np
@@ -30,10 +35,34 @@ from ..utils import (
     write_df,
 )
 
+
 config_yaml = files("MEDS_tabular_automl").joinpath("configs/tabularization.yaml")
 if not config_yaml.is_file():  # pragma: no cover
     raise FileNotFoundError("Core configuration not successfully installed!")
 
+# import tracemalloc
+# tracemalloc.start()
+
+import resource
+import sys
+def memory_limit_half():
+    """Limit max memory usage to half."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    # Convert KiB to bytes, and divide in two to ˝half
+    # resource.setrlimit(resource.RLIMIT_AS, (int(get_memory() * 1024 / 2), hard))
+
+    resource.setrlimit(resource.RLIMIT_AS, (int(get_memory() * 1024 / 4), hard))
+    # /8 fails
+    # /4?
+
+def get_memory():
+    with open('/proc/meminfo', 'r') as mem:
+        free_memory = 0
+        for i in mem:
+            sline = i.split()
+            if str(sline[0]) in ('MemFree:', 'Buffers:', 'Cached:'):
+                free_memory += int(sline[1])
+    return free_memory  # KiB
 
 @hydra.main(version_base=None, config_path=str(config_yaml.parent.resolve()), config_name=config_yaml.stem)
 def main(
@@ -65,6 +94,9 @@ def main(
         FileNotFoundError: If specified directories or files in the configuration are not found.
         ValueError: If required columns like 'code' or 'value' are missing in the data files.
     """
+    memory_limit_half()
+    print(get_memory() / 1024 / 1024, "GiB free memory")
+
     stage_init(
         cfg,
         [
@@ -92,13 +124,25 @@ def main(
         if agg not in [STATIC_CODE_AGGREGATION, STATIC_VALUE_AGGREGATION]
     ]
     tabularization_tasks = list(product(meds_shard_fps, cfg.tabularization.window_sizes, aggs))
-    np.random.shuffle(tabularization_tasks)
+    np.random.shuffle(tabularization_tasks) # for multiprocessing
 
     # iterate through them
+    k = 0
     for shard_fp, window_size, agg in iter_wrapper(tabularization_tasks):
+        
+        pl.enable_string_cache()
+        # sleep random time to avoid overloading the system
+        # between 250 and 1000 ms
+        time.sleep(np.random.uniform(0.25, 1.0))
+
         if cfg.input_label_dir:
             label_fp = Path(cfg.input_label_dir) / shard_fp.relative_to(shard_fp.parents[1])
             label_df = pl.scan_parquet(label_fp)
+
+            label_df = label_df.with_columns(
+                pl.col("prediction_time").cast(pl.Datetime("us")),  # ensure time is in us
+            )
+
         else:
             label_df = None
         out_fp = (
@@ -111,6 +155,16 @@ def main(
         def compute_fn(shard_df):
             # Load Sparse DataFrame
             index_df, sparse_matrix = get_flat_ts_rep(agg, feature_columns, shard_df)
+
+            # print(len(feature_columns))
+            # print(index_df.collect().shape)
+            # print(sparse_matrix.shape)
+            # print(sparse_matrix)
+            print("Sparse matrix loaded successfully.")
+            # print(label_df.collect())
+            
+            # n rows (subject/time) x n columns (feature columns) not AGGREGATED YET
+            # exit()
 
             # Summarize data -- applying aggregations on a specific window size + aggregation combination
             summary_df = generate_summary(
@@ -127,7 +181,9 @@ def main(
 
             del index_df
             del sparse_matrix
+            del shard_df
             gc.collect()
+
 
             logger.info("Writing pivot file")
             return summary_df
@@ -150,6 +206,23 @@ def main(
             do_overwrite=cfg.do_overwrite,
         )
 
+        if label_df is not None:
+            del label_df
+
+        # pl.clear_string_cache()
+        gc.collect()
+        k += 1
+        pl.disable_string_cache()
+        # if k == 2:
+            # break
+
 
 if __name__ == "__main__":
     main()
+
+    # snapshot = tracemalloc.take_snapshot()
+    # top_stats = snapshot.statistics("lineno")
+
+    # print("[ Top 10 memory consumers ]")
+    # for stat in top_stats[:10]:
+    #     print(stat)
