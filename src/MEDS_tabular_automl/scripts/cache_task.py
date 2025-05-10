@@ -174,6 +174,9 @@ def main(cfg: DictConfig):
         .group_by(pl.col("subject_id", "time"), maintain_order=True)
         .first()
     )
+    label_df = label_df.with_columns(
+        pl.col("time").cast(pl.Datetime("us")),  # ensure time is in us
+    )
 
     feature_columns = get_feature_columns(cfg.tabularization.filtered_code_metadata_fp)
 
