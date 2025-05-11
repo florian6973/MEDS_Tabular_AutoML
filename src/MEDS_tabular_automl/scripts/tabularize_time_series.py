@@ -35,25 +35,21 @@ from ..utils import (
     write_df,
 )
 
+import resource
+import sys
+# import tracemalloc
+# tracemalloc.start()
 
 config_yaml = files("MEDS_tabular_automl").joinpath("configs/tabularization.yaml")
 if not config_yaml.is_file():  # pragma: no cover
     raise FileNotFoundError("Core configuration not successfully installed!")
 
-# import tracemalloc
-# tracemalloc.start()
-
-import resource
-import sys
+# to avoid memory leakage?
 def memory_limit_half():
     """Limit max memory usage to half."""
     soft, hard = resource.getrlimit(resource.RLIMIT_AS)
     # Convert KiB to bytes, and divide in two to ˝half
-    # resource.setrlimit(resource.RLIMIT_AS, (int(get_memory() * 1024 / 2), hard))
-
-    resource.setrlimit(resource.RLIMIT_AS, (int(get_memory() * 1024 / 4), hard))
-    # /8 fails
-    # /4?
+    resource.setrlimit(resource.RLIMIT_AS, (int(get_memory() * 1024 / 3), hard))
 
 def get_memory():
     with open('/proc/meminfo', 'r') as mem:
@@ -131,9 +127,6 @@ def main(
     for shard_fp, window_size, agg in iter_wrapper(tabularization_tasks):
         
         pl.enable_string_cache()
-        # sleep random time to avoid overloading the system
-        # between 250 and 1000 ms
-        time.sleep(np.random.uniform(0.25, 1.0))
 
         if cfg.input_label_dir:
             label_fp = Path(cfg.input_label_dir) / shard_fp.relative_to(shard_fp.parents[1])
@@ -156,16 +149,6 @@ def main(
             # Load Sparse DataFrame
             index_df, sparse_matrix = get_flat_ts_rep(agg, feature_columns, shard_df)
 
-            # print(len(feature_columns))
-            # print(index_df.collect().shape)
-            # print(sparse_matrix.shape)
-            # print(sparse_matrix)
-            print("Sparse matrix loaded successfully.")
-            # print(label_df.collect())
-            
-            # n rows (subject/time) x n columns (feature columns) not AGGREGATED YET
-            # exit()
-
             # Summarize data -- applying aggregations on a specific window size + aggregation combination
             summary_df = generate_summary(
                 feature_columns,
@@ -183,7 +166,6 @@ def main(
             del sparse_matrix
             del shard_df
             gc.collect()
-
 
             logger.info("Writing pivot file")
             return summary_df
@@ -209,7 +191,6 @@ def main(
         if label_df is not None:
             del label_df
 
-        # pl.clear_string_cache()
         gc.collect()
         k += 1
         pl.disable_string_cache()
